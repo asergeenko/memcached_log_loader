@@ -1,0 +1,7 @@
+__pycache__/
+.idea/
+.pytest_cache/
+data/
+*.tsv.gz
+*.pdf
+memc_load.py
