@@ -32,5 +32,7 @@ idfa&nbsp;&nbsp;&nbsp;&nbsp;3rfw452y52g2gq4g&nbsp;&nbsp;&nbsp;&nbsp;55.55&nbsp;&
 
 ## Требования
 Python >= 3.6
+
 protobuf
+
 pymemcache
