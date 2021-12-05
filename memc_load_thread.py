@@ -125,6 +125,9 @@ class LogPipeline:
         self.device_memc = device_memc
         self.done = False
 
+    def set_connection(self):
+        [client.connect() for client in self.mc_clients.values()]
+
     def consumer(self,idx):
         logging.info(f"Consumer {idx} started")
 
@@ -163,7 +166,7 @@ class LogPipeline:
 
     def producer(self):
         logging.info("Producer started")
-        [client.connect() for client in self.mc_clients.values()]
+
         for fn in glob.iglob(self.options.pattern):
 
             logging.info('Processing %s' % fn)
@@ -192,6 +195,7 @@ class LogPipeline:
         self.done = True
 
     def run(self):
+        self.set_connection()
         pool = Pool(processes=self.options.workers + 1)
         pool.apply_async(self.producer)
         pool.map_async(self.consumer, range(self.options.workers))
@@ -248,7 +252,7 @@ if __name__ == '__main__':
     try:
         time_start = datetime.datetime.now()
         main(opts)
-        print (f'Time: {datetime.datetime.now()-time_start}')
+        print (f'Execution time: {datetime.datetime.now()-time_start}')
     except Exception as e:
         logging.exception("Unexpected error: %s" % e)
         sys.exit(1)
