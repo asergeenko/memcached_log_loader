@@ -170,10 +170,11 @@ class LogPipeline:
         logging.info("Producer started")
 
         for fn in glob.iglob(self.options.pattern):
-
+            self.processed = 0
+            self.errors = 0
             logging.info('Processing %s' % fn)
 
-            fd = gzip.open(fn, 'rt',encoding='utf-8')
+            fd = gzip.open(fn, 'rt', encoding='utf-8')
             batch = read_batch_from_file(fd)
             while batch:
                 self.queue.put(batch)
@@ -181,8 +182,6 @@ class LogPipeline:
             self.queue.join()
 
             if not self.processed:
-                self.processed = 0
-                self.errors = 0
                 fd.close()
                 dot_rename(fn)
                 continue
