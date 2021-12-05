@@ -121,12 +121,14 @@ class LogPipeline:
         self.queue = queue.Queue()
         self.lock = Lock()
         self.options = options
-        self.mc_clients = {addr: MCRetryingClient(addr) for addr in device_memc.values()}
+        self.mc_clients = {}
         self.device_memc = device_memc
         self.done = False
 
     def set_connection(self):
-        [client.connect() for client in self.mc_clients.values()]
+        for addr in self.device_memc.values():
+            self.mc_clients[addr] = MCRetryingClient(addr)
+            self.mc_clients[addr].connect()
 
     def consumer(self,idx):
         logging.info(f"Consumer {idx} started")
