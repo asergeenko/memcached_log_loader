@@ -29,7 +29,7 @@ import appsinstalled_pb2
 NORMAL_ERR_RATE = 0.01
 BATCH_SIZE = 400  # Lines
 
-# Constances below are for exponential backoff algorithm used in 'retry' decorator
+# Constants below are for exponential backoff algorithm used in 'retry' decorator
 
 MIN_DELAY = 0.1
 MAX_DELAY = 15 * 60
