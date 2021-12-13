@@ -17,17 +17,17 @@ from itertools import islice
 from threading import Lock
 from multiprocessing.dummy import Pool
 from pymemcache.client import base
-import queue
-
+from queue import Queue
 
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
 import appsinstalled_pb2
-#pip install pymemcache
+
+# pip install pymemcache
 
 NORMAL_ERR_RATE = 0.01
-BATCH_SIZE = 400 # Lines
+BATCH_SIZE = 400  # Lines
 
 # Constances below are for exponential backoff algorithm used in 'retry' decorator
 
@@ -37,6 +37,7 @@ DELAY_FACTOR = 2
 DELAY_JITTER = 0.1
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+
 
 def retry(num_tries):
     def decorator(f):
@@ -48,16 +49,19 @@ def retry(num_tries):
                     return f(*args, **kwargs)
                 except (TimeoutError, ConnectionError) as e:
                     time.sleep(delay)
-                    delay = min(delay*DELAY_FACTOR, MAX_DELAY)
-                    delay = max(random.gauss(delay, DELAY_JITTER),MIN_DELAY)
-            raise ConnectionError("Connection failed after %i tries"%(num_tries,))
+                    delay = min(delay * DELAY_FACTOR, MAX_DELAY)
+                    delay = max(random.gauss(delay, DELAY_JITTER), MIN_DELAY)
+            raise ConnectionError("Connection failed after %i tries" % (num_tries,))
+
         return wrapper
+
     return decorator
+
 
 class MCRetryingClient:
     max_retries = 5
 
-    def __init__(self,memc_addr):
+    def __init__(self, memc_addr):
         self.addr = memc_addr
         self.client = None
 
@@ -65,8 +69,8 @@ class MCRetryingClient:
         self.client = base.Client(self.addr)
 
     @retry(max_retries)
-    def set(self, key, value):
-        self.client.set(key, value)
+    def set_many(self, values):
+        return self.client.set_many(values)
 
 
 def dot_rename(path):
@@ -74,23 +78,29 @@ def dot_rename(path):
     # atomic in most cases
     os.rename(path, os.path.join(head, "." + fn))
 
-def insert_appsinstalled(memc_client, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
 
-    try:
+def insert_appsinstalled(memc_client: base.Client, appsinstalled_list, dry_run=False):
+    packed_dict = {}
+    for appsinstalled in appsinstalled_list:
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+
         if dry_run:
             logging.debug("%s - %s -> %s" % (memc_client.addr, key, str(ua).replace("\n", " ")))
         else:
-            memc_client.set(key,packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_client.addr, e))
-        return False
-    return True
+            packed_dict[key] = packed
+
+    if not dry_run:
+        try:
+            not_ok = len(memc_client.set_many(packed_dict))
+            return len(packed_dict) - not_ok, not_ok
+        except Exception as e:
+            logging.exception("Cannot write to memc %s: %s" % (memc_client.addr, e))
+            return 0, len(packed_dict)
 
 
 def parse_appsinstalled(line):
@@ -111,97 +121,78 @@ def parse_appsinstalled(line):
         logging.info("Invalid geo coords: `%s`" % line)
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
+
 def read_batch_from_file(fp):
-    return list(islice(fp,BATCH_SIZE))
+    return list(islice(fp, BATCH_SIZE))
 
-class LogPipeline:
-    def __init__(self, options,device_memc):
-        self.errors = 0
-        self.processed = 0
-        self.queue = queue.Queue()
-        self.lock = Lock()
-        self.options = options
-        self.mc_clients = {}
-        self.device_memc = device_memc
-        self.done = False
 
-    def set_connection(self):
-        for addr in self.device_memc.values():
-            self.mc_clients[addr] = MCRetryingClient(addr)
-            self.mc_clients[addr].connect()
+def consumer(idx, queue, lock, stats, device_memc, mc_clients, dry):
+    logging.info(f"Consumer {idx} started")
 
-    def consumer(self,idx):
-        logging.info(f"Consumer {idx} started")
+    while not stats['done']:
+        batch = queue.get(timeout=0.05)
+        if not batch:
+            continue
+        processed = errors = 0
 
-        while not self.done:
-            batch = self.queue.get(timeout=0.05)
-            if not batch:
+        apps = collections.defaultdict(list)
+
+        for line in batch:
+            line = line.strip()
+            if not line:
                 continue
-            processed = errors = 0
+            appsinstalled = parse_appsinstalled(line)
+            if not appsinstalled:
+                errors += 1
+                continue
+            memc_addr = device_memc.get(appsinstalled.dev_type)
+            if not memc_addr:
+                errors += 1
+                logging.error("Unknown device type: %s" % appsinstalled.dev_type)
+                continue
 
-            for line in batch:
-                line = line.strip()
-                if not line:
-                    continue
-                appsinstalled = parse_appsinstalled(line)
-                if not appsinstalled:
-                    errors += 1
-                    continue
-                memc_addr = self.device_memc.get(appsinstalled.dev_type)
-                if not memc_addr:
-                    errors += 1
-                    logging.error("Unknown device type: %s" % appsinstalled.dev_type)
-                    continue
+            apps[memc_addr].append(appsinstalled)
 
-                ok = insert_appsinstalled(self.mc_clients[memc_addr], appsinstalled, self.options.dry)
-                if ok:
-                    processed += 1
-                else:
-                    errors += 1
+        for memc_addr, appsinstalled_list in apps.items():
+            ok, not_ok = insert_appsinstalled(mc_clients[memc_addr], appsinstalled_list, dry)
+            processed += ok
+            errors += not_ok
 
-            with self.lock:
-                self.errors += errors
-                self.processed += processed
+        with lock:
+            stats['errors'] += errors
+            stats['processed'] += processed
 
-            self.queue.task_done()
+        queue.task_done()
 
 
-    def producer(self):
-        logging.info("Producer started")
+def producer(queue, stats, pattern):
+    logging.info("Producer started")
 
-        for fn in glob.iglob(self.options.pattern):
-            self.processed = 0
-            self.errors = 0
-            logging.info('Processing %s' % fn)
+    for fn in glob.iglob(pattern):
+        stats['processed'] = 0
+        stats['errors'] = 0
+        logging.info('Processing %s' % fn)
 
-            fd = gzip.open(fn, 'rt', encoding='utf-8')
+        fd = gzip.open(fn, 'rt', encoding='utf-8')
+        batch = read_batch_from_file(fd)
+        while batch:
+            queue.put(batch)
             batch = read_batch_from_file(fd)
-            while batch:
-                self.queue.put(batch)
-                batch = read_batch_from_file(fd)
-            self.queue.join()
+        queue.join()
 
-            if not self.processed:
-                fd.close()
-                dot_rename(fn)
-                continue
-
-            err_rate = float(self.errors) / self.processed
-            if err_rate < NORMAL_ERR_RATE:
-                logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
-            else:
-                logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+        if not stats['processed']:
             fd.close()
             dot_rename(fn)
-        self.done = True
+            continue
 
-    def run(self):
-        self.set_connection()
-        pool = Pool(processes=self.options.workers + 1)
-        pool.apply_async(self.producer)
-        pool.map_async(self.consumer, range(self.options.workers))
-        pool.close()
-        pool.join()
+        err_rate = float(stats['errors']) / stats['processed']
+        if err_rate < NORMAL_ERR_RATE:
+            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+        else:
+            logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+        fd.close()
+        dot_rename(fn)
+    stats['done'] = True
 
 
 def main(options):
@@ -211,9 +202,22 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
+    stats = {'errors': 0, 'processed': 0, 'done': False}
+    queue = Queue()
+    lock = Lock()
+    mc_clients = {}
 
-    pipeline = LogPipeline(options, device_memc)
-    pipeline.run()
+    for addr in device_memc.values():
+        mc_clients[addr] = MCRetryingClient(addr)
+        mc_clients[addr].connect()
+
+    pool = Pool(processes=options.workers + 1)
+    pool.apply_async(producer, (queue, stats, options.pattern))
+    pool.map_async(lambda idx: consumer(idx, queue, lock, stats, device_memc, mc_clients, options.dry),
+                   range(options.workers))
+    pool.close()
+    pool.join()
+
 
 def prototest():
     sample = "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
@@ -253,7 +257,7 @@ if __name__ == '__main__':
     try:
         time_start = datetime.datetime.now()
         main(opts)
-        print (f'Execution time: {datetime.datetime.now()-time_start}')
+        print(f'Execution time: {datetime.datetime.now() - time_start}')
     except Exception as e:
         logging.exception("Unexpected error: %s" % e)
         sys.exit(1)
